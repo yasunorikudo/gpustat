@@ -13,6 +13,7 @@ from collections import defaultdict
 from six.moves import cStringIO as StringIO
 
 import six
+import subprocess
 import sys
 import locale
 import platform
@@ -263,6 +264,21 @@ class GPUStatCollection(object):
                 # Bytes to MBytes
                 process['gpu_memory_usage'] = int(nv_process.usedGpuMemory / 1024 / 1024)
                 process['pid'] = nv_process.pid
+
+                # For docker
+                cmd = 'cat /proc/{}/cgroup'.format(nv_process.pid)
+                ret = subprocess.check_output(cmd.split())
+                container_id = str(ret).split('/')[2][:12]
+                process['container_id'] = container_id
+
+                cmd = 'docker ps -a'
+                ret = subprocess.check_output(cmd.split())
+                docker_data = str(ret).split('\\n')[1:-1]
+                for personal in docker_data:
+                    personal_data = personal.split()
+                    if container_id == personal_data[0]:
+                        process['container_user_name'] = personal_data[-1]
+
                 return process
 
             def _decode(b):
@@ -495,4 +511,65 @@ def main():
     print_gpustat(**vars(args))
 
 if __name__ == '__main__':
-    main()
+    from bottle import route, run, template
+
+    @route('/')
+    def gpu():
+        gpu_stats = GPUStatCollection.new_query()
+        json = gpu_stats.jsonify()
+        ss = '<div>{}</div>\n'.format(json['query_time'].strftime('%Y/%m/%d %H:%M:%S'))
+        for gpu in json['gpus']:
+            ss += '<br><div>GPU ID : {}, DEVICE NAME : {}</div>\n'.format(gpu['index'], gpu['name'])
+            ss += '<table border="1">'
+            ss += '<tr><th>USER NAME</th><th>MEMORY USAGE</th><th>PROCESS</th>' \
+            '<th>CPU-UTIL</th><th>GPU-UTIL</th><th>STATUS</th><th>START TIME</th></tr>'
+            for process in gpu['processes']:
+                if 'container_user_name' in process.keys():
+                    pid = process['pid']
+                    cmd = 'ps aux'
+                    ret = subprocess.check_output(cmd.split()).decode('utf-8')
+                    cpu_util = 'None'
+                    status = 'None'
+                    start = 'None'
+                    for line in ret.split('\n')[1:-1]:
+                        ps = line.split()
+                        if int(ps[1]) == pid:
+                            cpu_util = ps[2]
+                            status = ps[7]
+                            start = ps[8]
+                            break
+                    ss += '<tr><th>{}</th><th>{} / {} MiB</th><th>{}</th><th>{}%</th><th>---</th><th>{}</th><th>{}</th></tr>'.format(
+                        process['container_user_name'], process['gpu_memory_usage'],
+                        gpu['memory.total'], process['command'], cpu_util, status, start)
+            ss += '<tr><th>TOTAL</th><th> {} / {} MiB </th><th>---</th><th>---</th><th>{}%</th><th>---</th><th>---</th></tr>'.format(
+                gpu['memory.used'], gpu['memory.total'], gpu['utilization.gpu'])
+            ss += '</table>'
+
+        if not os.path.exists('views'):
+            os.mkdir('views')
+        with open('views/status.tpl', 'w') as f:
+            html = '''
+            <!DOCTYPE html>
+            <html lang=ja>
+              <head>
+                <meta charset="UTF-8">
+                <title>Aolab GPU Status</title>
+              </head>
+              <body>
+                <h1>{}</h1>
+                {}
+                <br>
+                <a href="http://25.59.18.57:8080" target="_self">AuroraR4</a>
+                <br>
+                <a href="http://25.15.246.208:8080" target="_self">aolab-SMBIOS</a>
+                <br>
+                <a href="http://25.28.225.255:8080" target="_self">DL-Box</a>
+                <br>
+                <a href="http://25.22.13.174:8080" target="_self">DL-Box2</a>
+              </body>
+            </html>
+            '''.format(json['hostname'], ss)
+            f.write(html)
+        return template('status')
+
+    run(host='0.0.0.0', port=8080, debug=True)
